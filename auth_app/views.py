@@ -60,6 +60,10 @@ from functools import wraps
 from django.utils.decorators import method_decorator
 from django.contrib.auth.forms import PasswordChangeForm
 from django.http import HttpResponseForbidden
+from celery import shared_task
+from django.utils.timezone import now
+from django.contrib.auth.signals import user_logged_in
+from django.dispatch import receiver
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
@@ -230,6 +234,33 @@ def seller_profile(request):
 
     is_waiting_for_verification = bool(request.user.subscription_payment and hasattr(request.user.subscription_payment, 'url'))
 
+    # Calculate remaining subscription days
+    today = timezone.now().date()
+    subscription_end_date = request.user.subscription_end_date.date() if request.user.subscription_end_date else None
+    days_remaining = (subscription_end_date - today).days if subscription_end_date else None
+
+    # Show pop-up notification only if it hasn't been shown today
+    show_subscription_warning = (
+        days_remaining is not None and days_remaining <= 5 and
+        (not request.user.last_notified or request.user.last_notified < today)
+    )
+
+    if show_subscription_warning:
+        # Send email notification
+        formatted_end_date = request.user.subscription_end_date.strftime("%B %d, %Y")
+        send_mail(
+            subject="Subscription Expiry Reminder",
+            message=f"Dear {request.user.first_name},\n\nYour subscription will expire in {days_remaining} days on {formatted_end_date}. "
+                    f"Please renew your subscription to continue selling your products.\n\nThank you!",
+            from_email="noreply@astig.com",
+            recipient_list=[request.user.email],
+            fail_silently=False,
+        )
+
+        # Update the last notified date
+        request.user.last_notified = today
+        request.user.save()
+
     return render(request, 'core/prof_seller.html', {
         'form': form,
         'user': request.user,
@@ -239,7 +270,9 @@ def seller_profile(request):
         'is_subscribed': request.user.is_subscribed,
         'subscription_payment': request.user.subscription_payment,
         'is_waiting_for_verification': is_waiting_for_verification,
-        'subscription_end_date': request.user.subscription_end_date,  # Add this line
+        'subscription_end_date': request.user.subscription_end_date,
+        'show_subscription_warning': show_subscription_warning,  # Pass the flag to the template
+        'days_remaining': days_remaining,  # Pass remaining days to the template
     })
 
 @csrf_exempt
@@ -327,6 +360,20 @@ def update_order_status(request, order_number):
     status = data.get('status')
     if status:
         transactions.update(status=status)
+
+        # Send email to the user if the status is "In Transit"
+        if status.lower() == "in transit":  # Ensure case-insensitivity
+            user_email = transactions[0].user.email
+            send_mail(
+                subject="Your Order is In Transit",
+                message=f"Dear {transactions[0].user.first_name},\n\n"
+                        f"Your order with order number {order_number} is now in transit.\n\n"
+                        f"Thank you for shopping with us!",
+                from_email="noreply@astig.com",
+                recipient_list=[user_email],
+                fail_silently=False,
+            )
+
         return JsonResponse({'success': True})
     return JsonResponse({'success': False, 'error': 'Invalid status'})
 
@@ -353,6 +400,37 @@ def mark_as_delivered(request, order_number):
             return JsonResponse({'error': 'Order not found or you do not have permission to mark this order as delivered.'}, status=404)
 
         transactions.update(status='Delivered')
+
+        # Send email to the user
+        # Send email to the user
+        user_email = transactions[0].user.email
+        send_mail(
+            subject="Order Delivered Notification",
+            message=f"Dear {transactions[0].user.first_name},\n\n"
+              f"Your order with order number {order_number} has been marked as delivered.\n\n"
+              f"Thank you for shopping with us!",
+            from_email="noreply@astig.com",
+            recipient_list=[user_email],
+            fail_silently=False,
+        )
+
+        # Send email to the seller(s)
+        seller_emails = set()
+        for transaction in transactions:
+            seller = transaction.product.seller
+            if seller.email:
+              seller_emails.add(seller.email)
+        for seller_email in seller_emails:
+            send_mail(
+          subject="Order Delivered Confirmation",
+          message=f"Dear Seller,\n\n"
+            f"The order with order number {order_number} has been marked as delivered to the customer.\n\n"
+            f"Thank you for using ASTIG Marketplace!",
+          from_email="noreply@astig.com",
+          recipient_list=[seller_email],
+          fail_silently=False,
+            )
+
         return JsonResponse({'success': True})
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
@@ -714,7 +792,6 @@ def create_stripe_session(request):
 @login_required
 def checkout(request):
     if request.method == 'POST':
-    
         item_ids = request.POST.get("item_ids")
         proof_of_payment = request.FILES.get("proof_of_payment")
 
@@ -724,27 +801,31 @@ def checkout(request):
             cart = Cart.objects.get(user=request.user)
             cart_items = CartItem.objects.filter(cart=cart, id__in=item_ids)
 
-  # Save the proof of payment file in the correct subdirectory
+            # Save the proof of payment file in the correct subdirectory
             fs = FileSystemStorage(location=os.path.join(settings.MEDIA_ROOT, 'proof_of_payment'))
             filename = fs.save(proof_of_payment.name, proof_of_payment)
             file_url = os.path.join('proof_of_payment', filename)
 
-             # Generate a unique order number
+            # Generate a unique order number
             order_number = str(uuid.uuid4())
             shipping_fee = calculate_shipping_fee(request.user)
-            
+
+            total_amount = 0
+            purchased_items = []
+
             for item in cart_items:
                 product = item.product
                 quantity = item.quantity
+                amount = product.price * quantity
+                total_amount += amount
 
                 # Create a transaction
                 Transaction.objects.create(
                     user=request.user,
-                    product=item.product,
-                    quantity=item.quantity,
-                    amount=item.product.price * item.quantity,
+                    product=product,
+                    quantity=quantity,
+                    amount=amount,
                     status='processing',
-
                     shipping_fee=shipping_fee,
                     proof_of_payment=proof_of_payment,
                     order_number=order_number  # Save the order number
@@ -754,8 +835,41 @@ def checkout(request):
                 product.stock -= quantity
                 product.save()
 
+                # Add item details to the receipt
+                purchased_items.append(f"{quantity} x {product.name} @ ₱{product.price:,.2f}")
+
+                # Send email to the seller
+                send_mail(
+                    subject="New Order Notification",
+                    message=f"Dear {product.seller.first_name},\n\n"
+                            f"You have received a new order for your product '{product.name}'.\n"
+                            f"Quantity: {quantity}\n"
+                            f"Total Amount: ₱{amount:,.2f}\n\n"
+                            f"Please process the order promptly.\n\nThank you!",
+                    from_email="noreply@astig.com",
+                    recipient_list=[product.seller.email],
+                    fail_silently=False,
+                )
+
             # Clear the selected items from the cart after checkout
             cart_items.delete()
+
+            # Send email receipt to the user
+            purchased_items_str = "\n".join(purchased_items)
+            send_mail(
+                subject="Your Order Receipt",
+                message=f"Dear {request.user.first_name},\n\n"
+                        f"Thank you for your purchase! Here are the details of your order:\n\n"
+                        f"Order Number: {order_number}\n"
+                        f"Items:\n{purchased_items_str}\n\n"
+                        f"Shipping Fee: ₱{shipping_fee:,.2f}\n"
+                        f"Total Amount: ₱{total_amount + shipping_fee:,.2f}\n\n"
+                        f"We appreciate your business and hope to see you again soon!\n\n"
+                        f"Thank you!",
+                from_email="noreply@astig.com",
+                recipient_list=[request.user.email],
+                fail_silently=False,
+            )
 
             return JsonResponse({'success': True})
 
@@ -788,16 +902,22 @@ def checkout_cod(request):
         # Generate a unique order number
         order_number = str(uuid.uuid4())
         shipping_fee = calculate_shipping_fee(request.user)
+
+        total_amount = 0
+        purchased_items = []
+
         for item in cart_items:
             product = item.product
             quantity = item.quantity
+            amount = product.price * quantity
+            total_amount += amount
 
             # Create a transaction
             Transaction.objects.create(
                 user=request.user,
                 product=product,
                 quantity=quantity,
-                amount=product.price * quantity,
+                amount=amount,
                 shipping_fee=shipping_fee,
                 status='processing',  # or 'completed' based on your logic
                 order_number=order_number  # Save the order number
@@ -807,12 +927,45 @@ def checkout_cod(request):
             product.stock -= quantity
             product.save()
 
+            # Add item details to the receipt
+            purchased_items.append(f"{quantity} x {product.name} @ ₱{product.price:,.2f}")
+
+            # Send email to the seller
+            send_mail(
+                subject="New Order Notification (Cash on Delivery)",
+                message=f"Dear {product.seller.first_name},\n\n"
+                        f"You have received a new order for your product '{product.name}'.\n"
+                        f"Quantity: {quantity}\n"
+                        f"Total Amount: ₱{amount:,.2f}\n\n"
+                        f"Please process the order promptly.\n\nThank you!",
+                from_email="noreply@astig.com",
+                recipient_list=[product.seller.email],
+                fail_silently=False,
+            )
+
         # Clear the selected items from the cart after checkout
         cart_items.delete()
 
+        # Send email receipt to the user
+        purchased_items_str = "\n".join(purchased_items)
+        send_mail(
+            subject="Your Order Receipt (Cash on Delivery)",
+            message=f"Dear {request.user.first_name},\n\n"
+                    f"Thank you for your purchase! Here are the details of your order:\n\n"
+                    f"Order Number: {order_number}\n"
+                    f"Items:\n{purchased_items_str}\n\n"
+                    f"Shipping Fee: ₱{shipping_fee:,.2f}\n"
+                    f"Total Amount: ₱{total_amount + shipping_fee:,.2f}\n\n"
+                    f"We appreciate your business and hope to see you again soon!\n\n"
+                    f"Thank you!",
+            from_email="noreply@astig.com",
+            recipient_list=[request.user.email],
+            fail_silently=False,
+        )
+
         return JsonResponse({'success': True})
 
-    return JsonResponse({'success': False, 'error': 'Invalid request method'})      
+    return JsonResponse({'success': False, 'error': 'Invalid request method'})
 
 @login_required
 def get_proof_of_payment(request, transaction_id):
@@ -867,7 +1020,7 @@ def change_status_delivered(request):
     return JsonResponse({'success': False, 'error': 'Invalid request method'})
 
 @login_required
-@csrf_exempt  
+@csrf_exempt
 def change_status(request):
     if request.method == 'POST':
         try:
@@ -880,6 +1033,19 @@ def change_status(request):
                 transaction.status = new_status
                 transaction.save()
                 logger.debug(f"Transaction {transaction_id} status changed to {new_status}")  # Debugging log
+
+                # Send email to the user if the status is "In Transit"
+                if new_status == "In transit":
+                    send_mail(
+                        subject="Your Order is In Transit",
+                        message=f"Dear {transaction.user.first_name},\n\n"
+                                f"Your order for '{transaction.product.name}' is now in transit.\n\n"
+                                f"Thank you for shopping with us!",
+                        from_email="noreply@astig.com",
+                        recipient_list=[transaction.user.email],
+                        fail_silently=False,
+                    )
+
                 return JsonResponse({'success': True})
             except Transaction.DoesNotExist:
                 logger.error(f"Transaction {transaction_id} not found")  # Debugging log
@@ -1326,6 +1492,29 @@ def toggle_user_status(request, user_id):
         user = User.objects.get(id=user_id)
         user.is_active = not user.is_active
         user.save()
+
+        # Send email notification
+        if not user.is_active:
+            # Email for account locked
+            send_mail(
+                subject="Account Locked by Admin",
+                message=f"Dear {user.first_name},\n\nYour account has been locked by the admin due to a violation of the website's rules. "
+                        f"If you believe this is a mistake, please contact support.\n\nThank you!",
+                from_email="noreply@astig.com",
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+        else:
+            # Email for account unlocked
+            send_mail(
+                subject="Account Unlocked",
+                message=f"Dear {user.first_name},\n\nYour account has been unlocked by the admin. You can now log in and continue using the platform. "
+                        f"If you have any questions, please contact support.\n\nThank you!",
+                from_email="noreply@astig.com",
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+
         return JsonResponse({"is_active": user.is_active})
     except User.DoesNotExist:
         return JsonResponse({"error": "User not found"}, status=404)
@@ -1443,6 +1632,17 @@ def update_subscription_status(request):
                 user.is_subscribed = False
                 user.subscription_end_date = None  # Clear the subscription end date
                 user.save()
+
+                # Send email notification
+                send_mail(
+                    subject="Account Locked Due to Subscription Non-Payment",
+                    message=f"Dear {user.first_name},\n\nYour account has been locked because your subscription has expired. "
+                            f"Please renew your subscription to regain access.\n\nThank you!",
+                    from_email="noreply@astig.com",
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+
                 return JsonResponse({"success": True, "message": "Subscription status updated."}, status=200)
             else:
                 return JsonResponse({"success": False, "message": "Subscription end date has not passed yet."}, status=400)
@@ -1595,3 +1795,34 @@ def extend_subscription_by_id(request, user_id):
         except Exception as e:
             return JsonResponse({"success": False, "message": str(e)}, status=500)
     return JsonResponse({"success": False, "message": "Invalid request method"}, status=405)
+  
+def notify_on_login(user):
+    """Notify sellers about expiring subscriptions on login."""
+    print(f"Checking subscription for user: {user.username}")  # Debugging log
+    if user.role == 'Seller' and user.is_subscribed:
+        today = now().date()
+        if user.subscription_end_date:
+            subscription_end_date = user.subscription_end_date.date()  # Convert to date
+            days_remaining = (subscription_end_date - today).days
+            print(f"Subscription end date: {subscription_end_date}, Days remaining: {days_remaining}")  # Debugging log
+
+            # Check if the notification was already sent today
+            if days_remaining <= 15 and (not user.last_notified or user.last_notified < today):
+                print(f"Sending email to: {user.email}")  # Debugging log
+                formatted_end_date = user.subscription_end_date.strftime("%B %d, %Y")
+                send_mail(
+                    subject="Subscription Expiry Reminder",
+                    message=f"Dear {user.first_name},\n\nYour subscription will expire in {days_remaining} days on {formatted_end_date}. "
+                            f"Please renew your subscription to continue selling your products.\n\nThank you!",
+                    from_email="noreply@astig.com",
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+                # Update the last notified date
+                user.last_notified = today
+                user.save()
+            
+@receiver(user_logged_in)
+def send_subscription_reminder(sender, request, user, **kwargs):
+    print(f"User logged in: {user.username}")  # Debugging log
+    notify_on_login(user)
